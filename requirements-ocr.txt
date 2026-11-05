@@ -1,0 +1,19 @@
+# Unlimited-OCR（スキャンPDFの読み取り）用。アプリ（.venv）とは別の仮想環境（.venv-ocr）に入れる
+# transformers 4.57 系が必要で、アプリの transformers 5.x とは同居できないため
+#
+# python3 -m venv .venv-ocr
+# .venv-ocr/bin/pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
+# .venv-ocr/bin/pip install -r requirements-ocr.txt
+#
+# モデル README（baidu/Unlimited-OCR）で動作確認されている版。torch は CUDA 12.8 版
+# （ドライバが CUDA 12.7 対応でも動作した）
+torch==2.10.0
+torchvision==0.25.0
+transformers==4.57.1
+Pillow==12.1.1
+matplotlib==3.10.8
+einops==0.8.2
+addict==2.4.0
+easydict==1.13
+pymupdf==1.27.2.2
+psutil==7.2.2

@@ -4,6 +4,8 @@
 /.venv/*
 /.venv-vllm/
 /.venv-vllm/*
+/.venv-ocr/
+/.venv-ocr/*
 
 # モデルの重み（README の手順で Hugging Face からダウンロード・量子化する）
 # PLaMo Community License のモデルなので、このリポジトリには含めない

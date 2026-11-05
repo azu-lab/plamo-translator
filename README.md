@@ -57,6 +57,7 @@ Linux（ネイティブ）でも同じ手順で動くはずですが、確認し
 | `.venv-vllm/` | vLLM サーバーの仮想環境 | [手順 4](#4-vllm-の環境を作る) |
 | `model-fp8/`, `model-0.8b-fp8/` | FP8 版のモデル（2B / 0.8B） | [手順 3](#3-モデルのサイズを選んでダウンロードする) |
 | `model/`, `model-4bit/` | BF16 版のモデルと、その 4bit 量子化版（Transformers で動かす場合だけ） | [Transformers で動かす](#transformers-で動かすvllm-が使えない場合) |
+| `.venv-ocr/`, `model-ocr/` | OCR（スキャンした PDF を読む場合だけ）の仮想環境とモデル | [スキャンした PDF を読む](#スキャンした-pdf-を読むocr任意) |
 
 モデルの重みは [PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-ja) で公開されています。そのため、このリポジトリでは再配布せず、各自が Hugging Face から取得する形にしています。
 
@@ -178,6 +179,30 @@ python app.py --backend transformers
 - 8bit にしたい場合は `python quantize.py --bits 8` を実行してください（保存先は `./model-8bit`）。
 - 量子化したあと、`./model` は削除してもかまいません。
 
+## スキャンした PDF を読む（OCR、任意）
+
+文字を持たないページ（スキャンした論文など）は、[Unlimited-OCR](https://huggingface.co/baidu/Unlimited-OCR)（Baidu、3B、MIT ライセンス）で読み取ってから翻訳できます。アプリとは transformers の版が合わないため、仮想環境を分けます（約 7 GB）。
+
+```bash
+python3 -m venv .venv-ocr
+.venv-ocr/bin/pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
+.venv-ocr/bin/pip install -r requirements-ocr.txt
+
+# モデル（約 6.7 GB）。同じ重みが 2 つ置かれているので、使う方だけを取る
+.venv/bin/hf download baidu/Unlimited-OCR --local-dir ./model-ocr \
+  --exclude "model.safetensors" --exclude "wheel/*" --exclude "assets/*" --exclude "*.pdf"
+```
+
+`.venv-ocr` と `model-ocr` があれば、PDF・文書翻訳タブの「スキャンしたページを OCR する」が使えるようになります（既定でオン）。
+
+- 文字をほとんど持たず、画像のあるページだけを OCR します。文字のあるページは、これまでどおり PDF の文字を使います。1 つの PDF に両方が混ざっていてもかまいません。
+- **OCR のあいだは、翻訳用の vLLM サーバーを止めます。** Unlimited-OCR は GPU メモリを約 6.8 GiB 使うため、8 GB の GPU では同時に動かせません。OCR が終わると自動で起動し直します（前後で 1 分ほど余分にかかります）。手動で起動した vLLM サーバー（`serve.sh`）や、Transformers で翻訳している場合は、GPU を空けられないので OCR は使えません。
+- 速さの目安（RTX 4060 Laptop）: 1 ページ約 40 秒です。スキャンした論文 3 ページの翻訳は、OCR と翻訳エンジンの再起動を含めて約 3 分でした。
+- OCR の結果は、見出し・段落・表・数式（LaTeX のまま、訳さない）・図（ページから切り出して埋め込む）に分けて、そのあとは通常の PDF と同じように処理します。
+- OCR のログは `logs/ocr.log` に出ます。
+
+vLLM（`.venv-vllm`）でも動かそうとしましたが、8 GB の GPU には BF16 の重みが収まらず、FP8 にすると繰り返しの抑制が効かずに出力が止まらなくなったため、Transformers を使っています。
+
 ## 使い方
 
 ### モデルの切り替え
@@ -218,6 +243,7 @@ python app.py --backend transformers
 | 段落ごとに原文を併記 | 各段落の下に、折りたたんだ原文を付けます |
 | 図を埋め込む | 図を画像としてファイルに埋め込みます（200dpi で 1 ページあたり 100 KB 程度大きくなります） |
 | 参考文献も翻訳する | 論文のとき、既定では参考文献は原文のまま残します |
+| スキャンしたページを OCR する | 文字を持たないページを OCR してから訳します。`.venv-ocr` と `model-ocr` があるときだけ使えます（[スキャンした PDF を読む](#スキャンした-pdf-を読むocr任意)） |
 
 #### 書籍を1冊まとめて訳す場合
 
@@ -247,19 +273,24 @@ plamo-translator/
 ├── app.py                        # GUI（Gradio）
 ├── backends.py                   # 翻訳エンジン（vLLM サーバー / Transformers）
 ├── paper.py                      # PDF / Markdown → 章立ての抽出 → Markdown / HTML 出力（論文・書籍）
+├── ocr.py                        # スキャンしたページの検出・OCR の呼び出し・OCR 結果の Markdown 化
+├── ocr_worker.py                 # OCR 本体（.venv-ocr で別プロセスとして動かす）
 ├── serve.sh                      # vLLM サーバーの起動
 ├── quantize.py                   # Transformers 用モデルの 4bit / 8bit 量子化
 ├── requirements.txt              # アプリ（.venv）
 ├── requirements-vllm.txt         # vLLM サーバー（.venv-vllm）
 ├── requirements-transformers.txt # Transformers で動かす場合（.venv に追加）
+├── requirements-ocr.txt          # OCR（.venv-ocr）
 ├── BENCHMARK.md                  # 測定結果
 ├── model-fp8/                    # (git 管理外) FP8 版のモデル
-└── model/, model-4bit/           # (git 管理外) Transformers 用のモデル
+├── model/, model-4bit/           # (git 管理外) Transformers 用のモデル
+└── model-ocr/                    # (git 管理外) OCR のモデル
 ```
 
 ## 制限事項
 
-- **スキャンした PDF（画像だけの PDF）は翻訳できません。** OCR は使っていません。
+- **スキャンした PDF は、OCR を入れたときだけ翻訳できます。** OCR は 1 ページ約 40 秒かかり、読み違いもあります（ぼやけたスキャンでは `omitted` → `committed` のような誤りが出ました）。
+- **図の中の文字は訳しません。** 図は画像として埋め込み、図の中から取り出した文字は捨てます（「図を埋め込む」をオフにすると、その文字も出力に残りません）。
 - **見出しが抜けることがあります。** 章立ては PDF の文字の大きさから判定しています（[pymupdf4llm](https://github.com/pymupdf/pymupdf4llm)）。見出しを取り出せなかった章は、前の章の中に入ります。
 - **2カラムの論文は、ページごとに「左カラム → 右カラム」の順に並べ直します。** 横幅いっぱいのタイトル・図表は区切りとして扱います。3カラム以上や、カラムの幅が左右で大きく違うレイアウトには対応していません。
 - **数式は崩れることがあります。** PDF から取り出した文字をそのまま翻訳しているためです。

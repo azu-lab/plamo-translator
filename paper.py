@@ -466,6 +466,10 @@ def _split_raw_blocks(md: str) -> List[str]:
     return blocks
 
 
+_PICTURE_TEXT_RE = re.compile(
+    r"(<!--|-{3,})\s*Start of picture text\s*(-->|-{3,}).*?(<!--|-{3,})\s*End of picture text\s*(-->|-{3,})",
+    re.DOTALL,
+)
 _IMAGE_RE = re.compile(r"!\[[^\]\n]*\]\([^)\s]*\)?")   # 閉じ括弧のない（途中で切れた）画像も含む
 _INLINE_CODE_RE = re.compile(r"`[^`]*`")
 
@@ -484,6 +488,10 @@ def parse_blocks(md: str, mode: str = PAPER, title: Optional[str] = None) -> Lis
     document = mode == DOCUMENT
     in_note = False
     chapter_number = ""
+
+    # pymupdf4llm が図の中の文字を書き出した部分。図は画像として埋め込むので訳さずに除く
+    # （訳すと囲みの印まで訳され、図のラベルが細切れの文として並んでしまう）
+    md = _PICTURE_TEXT_RE.sub("\n\n", md)
 
     if document:
         if title:

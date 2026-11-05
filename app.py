@@ -10,6 +10,7 @@ import tempfile
 
 import gradio as gr
 
+import ocr
 import paper
 from backends import TransformersBackend, VllmBackend, VllmServer, find_vllm_models
 
@@ -93,10 +94,51 @@ def get_backend():
     return _backend
 
 
+_ocr_status = ""      # OCR 中の表示（空なら翻訳エンジンの状態を出す）
+
+
 def engine_status():
+    if _ocr_status:
+        return _ocr_status
     if vllm_server is not None:
         return vllm_server.status_text()
     return f"✅ `{_backend.name}` で翻訳できます"
+
+
+def run_ocr_freeing_gpu(path, pages, on_progress):
+    """翻訳エンジンを止めて GPU を空け、OCR してから翻訳エンジンを起動し直す
+
+    Unlimited-OCR は GPU メモリを約 6.8 GiB 使うため、8 GB の GPU では翻訳用の
+    vLLM サーバーと同時に動かせない。
+    """
+    global _backend, _ocr_status
+    if isinstance(_backend, TransformersBackend):
+        raise gr.Error("OCR は vLLM で翻訳しているときだけ使えます"
+                       "（Transformers の翻訳モデルが GPU を使ったままになるため）。")
+    restart = vllm_server.model_path if vllm_server is not None and vllm_server.process else None
+    _ocr_status = f"📷 OCR 中（{len(pages)} ページ）のため、翻訳エンジンを一時停止しています"
+    try:
+        if restart:
+            _backend = None
+            vllm_server.stop()
+        free = ocr.gpu_free_mib()
+        if free is not None and free < ocr.REQUIRED_FREE_MIB:
+            raise gr.Error(
+                f"OCR に必要な GPU メモリが空いていません（空き {free} MiB、必要 約 {ocr.REQUIRED_FREE_MIB} MiB）。"
+                "手動で起動した vLLM サーバー（serve.sh）などを止めてから実行してください。"
+            )
+        try:
+            return ocr.run_ocr(path, pages, on_progress)
+        except RuntimeError as e:
+            raise gr.Error(str(e))
+    finally:
+        _ocr_status = ""
+        if restart:
+            try:
+                vllm_server.start(restart)
+                _backend = VllmBackend(args.vllm_url)
+            except Exception as e:
+                gr.Warning(f"翻訳エンジンを起動し直せませんでした: {e}")
 
 
 def switch_model(model_path):
@@ -304,11 +346,40 @@ def show_chapters(files, mode):
             gr.update(visible=True))
 
 
-def load_units(path, mode, page_range, chapter_ids, with_images, image_dpi, stem):
+def pdf_markdown(path, pages, mode, with_images, image_dpi, ocr_texts):
+    """PDF のページを Markdown にする。OCR したページは OCR の結果を、それ以外は PDF の文字を使う"""
+    import pymupdf
+
+    with pymupdf.open(path) as doc:
+        page_list = list(pages) if pages is not None else list(range(doc.page_count))
+        if not any(p in ocr_texts for p in page_list):
+            return paper.pdf_to_markdown(path, with_images=with_images, mode=mode,
+                                         pages=pages, image_dpi=image_dpi)
+        parts, run = [], []
+
+        def flush():
+            if run:
+                parts.append(paper.pdf_to_markdown(path, with_images=with_images, mode=mode,
+                                                   pages=list(run), image_dpi=image_dpi))
+                run.clear()
+
+        for p in page_list:
+            if p in ocr_texts:
+                flush()
+                parts.append(ocr.ocr_to_markdown(ocr_texts[p], doc[p], with_images, image_dpi))
+            else:
+                run.append(p)
+        flush()
+    return "\n\n".join(parts)
+
+
+def load_units(path, mode, page_range, chapter_ids, with_images, image_dpi, stem,
+               use_ocr=False, on_ocr_progress=None):
     """ファイルを読み、(出力の単位のリスト, 文書の種類) を返す
 
     出力の単位は (ファイル名に付ける名前, ブロック列)。書籍の PDF で章を選んだときは章ごと、
     それ以外はファイル全体で1つ。
+    use_ocr なら、文字を持たないページ（スキャン）を先に OCR しておく。
     """
     if not _is_pdf(path):
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -323,25 +394,42 @@ def load_units(path, mode, page_range, chapter_ids, with_images, image_dpi, stem
         stem = (doc.metadata or {}).get("title", "").strip() or stem
     pages = parse_page_range(page_range, page_count)
     chapters = book_chapters(path, mode) if pages is None else []
-
+    selected = []
     if chapters:
         selected = [chapters[int(i)] for i in (chapter_ids or []) if int(i) < len(chapters)]
         if not selected:
             raise gr.Error("訳す章を1つ以上選んでください。")
+        targets = [p for ch in selected for p in range(ch.start, ch.end)]
+    else:
+        targets = pages if pages is not None else list(range(page_count))
+
+    ocr_texts = {}
+    if use_ocr and ocr.ocr_available():
+        scanned = ocr.find_scanned_pages(path, targets)
+        if scanned:
+            ocr_texts = run_ocr_freeing_gpu(path, scanned, on_ocr_progress)
+
+    if chapters:
         units = []
         for n, ch in enumerate(selected):
-            md_source = paper.pdf_to_markdown(
-                path, with_images=with_images, mode=paper.DOCUMENT,
-                pages=range(ch.start, ch.end), image_dpi=int(image_dpi),
-            )
+            md_source = pdf_markdown(path, range(ch.start, ch.end), paper.DOCUMENT,
+                                     with_images, int(image_dpi), ocr_texts)
             blocks = paper.parse_blocks(md_source, mode=paper.DOCUMENT, title=stem)
             paper.apply_outline(blocks, ch)
             units.append((f"{n + 1:02d}_{_slug(ch.title)}", blocks))
         return units, paper.DOCUMENT
 
-    doc_mode = paper.detect_pdf_mode(path, pages) if mode == "auto" else mode
-    md_source = paper.pdf_to_markdown(path, with_images=with_images, mode=doc_mode,
-                                      pages=pages, image_dpi=int(image_dpi))
+    if mode != "auto":
+        doc_mode = mode
+    elif any(p in ocr_texts for p in targets[:3]):
+        # スキャンしたページを含むときは、冒頭3ページの文字（OCR したページは OCR の結果）で判定する
+        with pymupdf.open(path) as doc:
+            head = [ocr.ocr_to_markdown(ocr_texts[p], with_images=False) if p in ocr_texts
+                    else doc[p].get_text() for p in targets[:3]]
+        doc_mode = paper.detect_mode("\n\n".join(head))
+    else:
+        doc_mode = paper.detect_pdf_mode(path, pages)
+    md_source = pdf_markdown(path, pages, doc_mode, with_images, int(image_dpi), ocr_texts)
     return [("", paper.parse_blocks(md_source, mode=doc_mode, title=stem))], doc_mode
 
 
@@ -353,7 +441,7 @@ def _slug(title, max_len=40):
 
 def translate_files(files, source_lang, target_lang, form, formats,
                     bilingual, with_images, translate_refs, mode, page_range, image_dpi,
-                    chapter_ids, split_chapters, progress=gr.Progress()):
+                    chapter_ids, split_chapters, use_ocr=False, progress=gr.Progress()):
     if not files:
         raise gr.Error("ファイルを選択してください。")
     if not formats:
@@ -370,8 +458,12 @@ def translate_files(files, source_lang, target_lang, form, formats,
         prefix = f"[{n + 1}/{len(files)}] {name}"
 
         progress(0, desc=f"{prefix}: 本文を抽出中（書籍1冊では数分かかります）")
+        def on_ocr_progress(done, total):
+            progress(done / max(total, 1),
+                     desc=f"{prefix}: スキャンしたページを OCR 中 ({done}/{total} ページ、1 ページ約 40 秒)")
+
         units, doc_mode = load_units(path, mode, page_range, chapter_ids if len(files) == 1 else None,
-                                     with_images, image_dpi, stem)
+                                     with_images, image_dpi, stem, use_ocr, on_ocr_progress)
         if not split_chapters and len(units) > 1:
             # 選んだ章を1つのファイルにまとめる（題は先頭の1つだけ残す）
             merged = units[0][1] + [b for _, blocks in units[1:] for b in blocks if b.kind != "title"]
@@ -379,9 +471,9 @@ def translate_files(files, source_lang, target_lang, form, formats,
 
         all_blocks = [b for _, blocks in units for b in blocks]
         if not any(b.text for b in all_blocks if b.kind not in ("title", "heading", "table", "image")):
-            raise gr.Error(
-                f"{name}: テキストを抽出できませんでした（スキャン画像のPDFはOCRが必要です）。"
-            )
+            hint = ("「スキャンしたページを OCR する」をオンにしてください。" if ocr.ocr_available()
+                    else "スキャンした PDF は OCR が必要です（README の「スキャンした PDF を読む」を参照）。")
+            raise gr.Error(f"{name}: テキストを抽出できませんでした。{hint}")
 
         def on_progress(done, total):
             progress(done / total, desc=f"{prefix}: 翻訳中 ({done}/{total} 段落)")
@@ -534,6 +626,14 @@ with gr.Blocks(title="PLaMo Translator") as demo:
         )
         p_split = gr.Checkbox(True, label="章ごとにファイルを分ける（ZIPにもまとめます）",
                               visible=False)
+        p_ocr = gr.Checkbox(
+            ocr.ocr_available(),
+            label="スキャンしたページ（文字を持たないページ）を OCR する（Unlimited-OCR・1 ページ約 40 秒）",
+            info=("OCR のあいだは翻訳エンジンを止めて GPU を空けるので、前後に 1 分ほど余分にかかります。"
+                  if ocr.ocr_available() else
+                  "使うには .venv-ocr と model-ocr が必要です（README の「スキャンした PDF を読む」）。"),
+            interactive=ocr.ocr_available(),
+        )
 
         with gr.Row():
             p_formats = gr.CheckboxGroup(
@@ -570,7 +670,7 @@ with gr.Blocks(title="PLaMo Translator") as demo:
             fn=translate_files,
             inputs=[pdf_input, p_source, p_target, p_form, p_formats,
                     p_bilingual, p_images, p_refs, p_mode, p_pages, p_dpi,
-                    p_chapters, p_split],
+                    p_chapters, p_split, p_ocr],
             outputs=[output_file, preview_md]
         )
 
