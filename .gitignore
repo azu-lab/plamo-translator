@@ -27,3 +27,6 @@ translated_papers.zip
 .DS_Store
 Thumbs.db
 *:Zone.Identifier
+
+# アプリが起動した vLLM サーバーのログ
+/logs/

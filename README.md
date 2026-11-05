@@ -50,7 +50,7 @@ Linux（ネイティブ）でも同じ手順で動くはずですが、確認し
 |---|---|---|
 | `.venv/` | アプリの仮想環境 | [手順 2](#2-アプリの環境を作る) |
 | `.venv-vllm/` | vLLM サーバーの仮想環境 | [手順 4](#4-vllm-の環境を作る) |
-| `model-fp8/` | FP8 版のモデル（0.8B または 2B） | [手順 3](#3-モデルのサイズを選んでダウンロードする) |
+| `model-fp8/`, `model-0.8b-fp8/` | FP8 版のモデル（2B / 0.8B） | [手順 3](#3-モデルのサイズを選んでダウンロードする) |
 | `model/`, `model-4bit/` | BF16 版のモデルと、その 4bit 量子化版（Transformers で動かす場合だけ） | [Transformers で動かす](#transformers-で動かすvllm-が使えない場合) |
 
 モデルの重みは [PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-ja) で公開されています。そのため、このリポジトリでは再配布せず、各自が Hugging Face から取得する形にしています。
@@ -101,15 +101,15 @@ pip install -r requirements.txt
 
 0.8B は、ツール名などの固有名詞を普通の言葉として訳してしまうことがあります（例: `safe drive and async lib` →「安全なドライブおよび非同期ライブラリ」）。具体例は [BENCHMARK.md](BENCHMARK.md#訳の質) を参照してください。
 
-どちらのサイズでも保存先は `./model-fp8` です。
-
 ```bash
 # 2B（推奨）
 hf download pfnet/plamo-3-translate-2b-FP8 --local-dir ./model-fp8
 
 # 0.8B
-hf download pfnet/plamo-3-translate-0.8b-FP8 --local-dir ./model-fp8
+hf download pfnet/plamo-3-translate-0.8b-FP8 --local-dir ./model-0.8b-fp8
 ```
+
+両方ダウンロードしておくと、アプリの画面でモデルを切り替えられます（[モデルの切り替え](#モデルの切り替え)）。保存先のディレクトリ名は `model` で始まっていれば自由です。アプリが自動で見つけます。
 
 ### 4. vLLM の環境を作る
 
@@ -125,26 +125,22 @@ python3 -m venv .venv-vllm
 
 ### 5. 起動する
 
-ターミナルを 2 つ使います。
-
 ```bash
-# ターミナル 1: vLLM サーバー（「Application startup complete」と出るまで 1〜2 分かかります）
-./serve.sh
-```
-
-```bash
-# ターミナル 2: アプリ
 source .venv/bin/activate
 python app.py
 ```
 
-起動後、Windows のブラウザで <http://localhost:7860> を開きます（WSL2 から Windows への localhost 転送は自動で行われます）。
+アプリが vLLM サーバー（`serve.sh`）を自動で起動します。起動後、Windows のブラウザで <http://localhost:7860> を開いてください（WSL2 から Windows への localhost 転送は自動で行われます）。
 
-画面上部の「翻訳エンジン」に `vLLM (...)` と表示されていれば、vLLM で動いています。
+- 画面上部に「⏳ 起動中…」と表示されている間は、翻訳できません。「✅ … で翻訳できます」になったら使えます。初回は 1〜2 分、2 回目以降は 30 秒ほどかかります。
+- アプリを Ctrl+C で終了すると、vLLM サーバーも止まって VRAM が解放されます。
+- vLLM サーバーのログは `logs/vllm.log` に出ます。
+
+`./serve.sh` を別のターミナルで先に起動しておくこともできます。その場合、アプリはそのサーバーを使います。ただし、画面からモデルは切り替えられません。
 
 #### serve.sh の設定
 
-`serve.sh` の設定は環境変数で変えられます。
+`serve.sh` の設定は環境変数で変えられます。アプリから起動する場合も、`python app.py` の前に設定すれば反映されます（例: `GPU_UTIL=0.6 python app.py`）。
 
 | 環境変数 | 既定値 | 内容 |
 |---|---|---|
@@ -170,7 +166,7 @@ hf download pfnet/plamo-3-translate-0.8b --local-dir ./model   # 0.8B（1.7 GB�
 # 4bit に量子化する（任意だが推奨。VRAM と読み込み時間が約 1/3 になる）
 python quantize.py               # ./model -> ./model-4bit
 
-python app.py                    # vLLM サーバーが無ければ自動で Transformers を使う
+python app.py --backend transformers
 ```
 
 - アプリは `./model-4bit` があればそれを、なければ `./model` を使います。
@@ -178,6 +174,15 @@ python app.py                    # vLLM サーバーが無ければ自動で Tra
 - 量子化したあと、`./model` は削除してもかまいません。
 
 ## 使い方
+
+### モデルの切り替え
+
+画面上部の「翻訳モデル」でモデルを選び、「モデルを切り替え」を押します。
+
+- 選択肢には、プロジェクト直下の `model…` ディレクトリのうち、vLLM で動かせるもの（FP8 版・BF16 版）が出ます。`quantize.py` で作った 4bit 版は Transformers 用なので出ません。
+- 切り替えは vLLM サーバーの再起動になるため、30 秒〜2 分かかります。その間は翻訳ボタンを押せません。
+- 切り替えたあとの翻訳速度は、最初からそのモデルで起動した場合と同じです。
+- 起動できなかった場合（VRAM 不足など）は、元のモデルに戻します。
 
 ### テキスト翻訳タブ
 
@@ -203,7 +208,8 @@ PDF 翻訳タブのオプションは次のとおりです。
 
 | オプション | 既定値 | 内容 |
 |---|---|---|
-| `--backend` | `auto` | `vllm` / `transformers` / `auto`（vLLM サーバーがあればそれ、なければ Transformers） |
+| `--backend` | `auto` | `vllm` / `transformers` / `auto`（起動済みの vLLM サーバー → アプリが vLLM を起動 → Transformers の順に試す） |
+| `--vllm-model PATH` | `./model-fp8` | アプリが vLLM を起動するときに最初に使うモデル。環境変数 `VLLM_MODEL` でも指定できます |
 | `--vllm-url URL` | `http://localhost:8000/v1` | vLLM サーバーの URL。環境変数 `VLLM_URL` でも指定できます |
 | `--model PATH` | `./model-4bit`（なければ `./model`） | Transformers で使うモデル。環境変数 `PLAMO_MODEL` でも指定できます |
 | `--batch-size N` | `8` | Transformers で一度に訳す段落数。VRAM が足りなければ下げてください |

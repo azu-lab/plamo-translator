@@ -8,8 +8,15 @@
 """
 
 import gc
+import json
 import os
+import signal
+import subprocess
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
@@ -78,6 +85,155 @@ class VllmBackend:
 
     def free_memory(self):
         pass
+
+
+# ------------------------------------------------------------
+# vLLM サーバーの起動・停止（GUI からのモデル切り替え用）
+# ------------------------------------------------------------
+_SIZE_BY_HIDDEN = {1536: "0.8B", 2560: "2B"}
+
+
+def find_vllm_models(root="."):
+    """root 直下で vLLM に渡せるモデルのディレクトリを探す
+
+    bitsandbytes の量子化モデル（quantize.py で作ったもの）は Transformers 用なので除く。
+    戻り値: [(表示名, パス), ...]
+    """
+    models = []
+    for d in sorted(Path(root).iterdir()):
+        config_path = d / "config.json"
+        if not d.is_dir() or not d.name.startswith("model") or not config_path.is_file():
+            continue
+        try:
+            config = json.loads(config_path.read_text())
+        except (OSError, ValueError):
+            continue
+        quant = (config.get("quantization_config") or {}).get("quant_method")
+        if quant == "bitsandbytes":
+            continue
+        size = _SIZE_BY_HIDDEN.get(config.get("hidden_size"), "?")
+        fmt = (quant or "bf16").upper()
+        models.append((f"{size} {fmt}（{d.name}）", f"./{d.name}"))
+    return models
+
+
+class VllmServer:
+    """serve.sh で vLLM サーバーを起動・停止し、モデルを切り替える
+
+    切り替えはサーバーの再起動になる（1〜2分かかる）。
+    アプリの終了時には stop() でサーバーも止める。
+    """
+
+    def __init__(self, base_url, log_path="logs/vllm.log", startup_timeout=600):
+        self.base_url = base_url.rstrip("/")
+        self.log_path = Path(log_path)
+        self.startup_timeout = startup_timeout
+        self.process = None
+        self.model_path = None
+        self.state = "stopped"      # stopped / starting / ready / error
+        self.message = ""
+        self.started_at = None
+        self._lock = threading.Lock()
+
+    @property
+    def ready(self):
+        return self.state == "ready"
+
+    def status_text(self):
+        if self.state == "starting":
+            elapsed = int(time.time() - self.started_at) if self.started_at else 0
+            return f"⏳ `{self.model_path}` を起動中…（{elapsed} 秒経過。通常 1〜2 分かかります）"
+        if self.state == "ready":
+            return f"✅ `{self.model_path}` で翻訳できます"
+        if self.state == "error":
+            return f"⚠️ {self.message}"
+        return "停止中"
+
+    def start(self, model_path):
+        """サーバーを起動し、翻訳を受け付けられるようになるまで待つ。失敗したら例外"""
+        with self._lock:
+            self._stop_locked()
+            self.model_path = model_path
+            self.state = "starting"
+            self.started_at = time.time()
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            log = open(self.log_path, "w")
+            port = urlparse(self.base_url).port or 8000
+            env = dict(os.environ, MODEL=model_path, PORT=str(port))
+            # 新しいプロセスグループで起動し、停止時に vLLM の子プロセスごと止められるようにする
+            self.process = subprocess.Popen(
+                ["./serve.sh"], env=env, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                self._wait_ready()
+            except Exception as e:
+                self._stop_locked()
+                self.state = "error"
+                self.message = str(e)
+                raise
+            self.state = "ready"
+
+    def switch(self, model_path):
+        """モデルを切り替える。失敗したら元のモデルで起動し直してから例外を投げる"""
+        previous = self.model_path
+        try:
+            self.start(model_path)
+        except Exception as e:
+            if previous and previous != model_path:
+                self.start(previous)
+                self.message = f"{model_path} を起動できなかったため、{previous} に戻しました: {e}"
+            raise
+
+    def _wait_ready(self):
+        deadline = time.time() + self.startup_timeout
+        while time.time() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError(
+                    f"vLLM サーバーが起動中に終了しました（詳細: {self.log_path}）\n" + self._log_tail()
+                )
+            if VllmBackend.is_available(self.base_url):
+                return
+            time.sleep(2)
+        raise TimeoutError(f"vLLM サーバーが {self.startup_timeout} 秒以内に起動しませんでした（詳細: {self.log_path}）")
+
+    def _log_tail(self, lines=5):
+        try:
+            text = self.log_path.read_text(errors="replace").splitlines()
+        except OSError:
+            return ""
+        errors = [l for l in text if "Error" in l or "error" in l]
+        return "\n".join((errors or text)[-lines:])
+
+    def stop(self):
+        with self._lock:
+            self._stop_locked()
+
+    def _stop_locked(self):
+        if self.process is None:
+            return
+        if self.process.poll() is None:
+            pgid = os.getpgid(self.process.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            try:
+                self.process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(pgid, signal.SIGKILL)
+                self.process.wait()
+            # EngineCore などの子プロセスが VRAM を解放するまで待つ
+            for _ in range(30):
+                try:
+                    os.killpg(pgid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(1)
+            else:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        self.process = None
+        self.state = "stopped"
 
 
 # ------------------------------------------------------------
