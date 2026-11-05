@@ -5,15 +5,28 @@
         --translate(バッチ)--> 訳文付きブロック --render_markdown / render_html--> 出力
 
 翻訳モデルには依存せず、`translate_many(list[str]) -> list[str]` を外から受け取る。
+
+文書の種類（mode）:
+    PAPER    論文。章番号付きの見出しだけを章とみなし、著者・所属と参考文献は原文のまま残す
+    DOCUMENT 書籍の電子版・AIとのチャットの書き出しなど。見出しは文字の大きさの順に従い、
+             全文を訳す。表の文章も訳し、欄外のアイコン付きの囲み（Note など）は引用にする
 """
 
+import copy
 import html
 import re
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 
 import pymupdf4llm
 from markdown_it import MarkdownIt
+
+PAPER = "paper"
+DOCUMENT = "document"
+
+# 欄外アイコン付きの囲みの始まりと終わりの目印（Markdown の画像の場所に入れておく）
+NOTE_START = "plamo:note-start"
+NOTE_END = "plamo:note-end"
 
 
 # ------------------------------------------------------------
@@ -35,20 +48,37 @@ class Block:
 # ------------------------------------------------------------
 # PDF -> Markdown
 # ------------------------------------------------------------
-def pdf_to_markdown(pdf_path: str, with_images: bool = True) -> str:
+def pdf_to_markdown(
+    pdf_path: str,
+    with_images: bool = True,
+    mode: str = PAPER,
+    pages: Optional[Sequence[int]] = None,
+    image_dpi: int = 150,
+) -> str:
+    """pages は 0 始まりのページ番号（None なら全ページ）。image_dpi は図を切り出す解像度"""
     options = dict(
         use_ocr=False,        # テキストを持つPDFならOCR不要（遅い）
         embed_images=with_images,
         show_progress=False,
+        pages=list(pages) if pages is not None else None,
     )
+    import pymupdf
+
+    # 表などが90度回して載っているページは、向きを直してから解析する（ファイルは書き換えない）
+    doc = pymupdf.open(pdf_path)
+    upright_rotated_pages(doc, options["pages"])
     try:
         # pymupdf4llm の解析結果（ページごとのブロック）を受け取り、
         # 2カラムの読み順を直してから Markdown にする
         from pymupdf4llm.helpers import document_layout
 
-        parsed = document_layout.parse_document(pdf_path, force_text=True, **options)
+        parsed = document_layout.parse_document(
+            doc, force_text=True, image_dpi=image_dpi, **options
+        )
         for page in parsed.pages:
             page.boxes = order_two_columns(page.boxes, page.width)
+            if mode == DOCUMENT:
+                page.boxes = mark_side_notes(page.boxes)
         return parsed.to_markdown(
             header=False,     # ページヘッダー・フッターを除く
             footer=False,
@@ -57,10 +87,204 @@ def pdf_to_markdown(pdf_path: str, with_images: bool = True) -> str:
         )
     except (ImportError, AttributeError, TypeError):
         # pymupdf4llm の内部APIが変わった場合は、読み順の補正なしで変換する
-        return pymupdf4llm.to_markdown(pdf_path, header=False, footer=False, **options)
+        return pymupdf4llm.to_markdown(
+            doc, header=False, footer=False, dpi=image_dpi, **options
+        )
+    finally:
+        doc.close()
+
+
+def upright_rotated_pages(doc, pages: Optional[Sequence[int]] = None) -> List[int]:
+    """本文の大半が90度回転しているページ（縦長のページに横長の表を載せたものなど）の向きを直す
+
+    pymupdf4llm は回転した文字を1行ずつの細切れとして読むため、表の行と列が崩れる。
+    ページの表示の向き（/Rotate）を変えると、表を横向きのまま正しく読み取れる。
+    ページ上端の柱（ページ番号・章名）は回転していないことが多いので、文字数の多数決で決める。
+    向きを直したページの番号（0 始まり）を返す。
+    """
+    fixed = []
+    for i in (pages if pages is not None else range(doc.page_count)):
+        page = doc[i]
+        counts = {}
+        cjk = 0
+        for block in page.get_text("dict", flags=0)["blocks"]:
+            for line in block.get("lines", []):
+                dx, dy = (round(v) for v in line["dir"])
+                text = "".join(sp["text"] for sp in line["spans"]).strip()
+                counts[(dx, dy)] = counts.get((dx, dy), 0) + len(text)
+                if (dx, dy) != (1, 0):
+                    cjk += len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff]", text))
+        total = sum(counts.values())
+        if total < 50:
+            continue
+        rotated = total - counts.get((1, 0), 0)
+        if rotated and cjk > rotated * 0.5:
+            continue    # 日本語・中国語の縦書きの本文は、回転した表ではないので触らない
+        # dir は回転前の座標での文字の進む向き。(0,-1) は下から上 → 時計回りに90度回すと読める
+        for direction, rotation in (((0, -1), 90), ((0, 1), 270), ((-1, 0), 180)):
+            if counts.get(direction, 0) > total * 0.6:
+                if page.rotation != rotation:
+                    page.set_rotation(rotation)
+                    fixed.append(i)
+                break
+    return fixed
+
+
+def detect_mode(text: str) -> str:
+    """冒頭に Abstract（要旨）か「1 Introduction」があれば論文、なければ書籍・一般文書とみなす"""
+    head = text[:12000]
+    flags = re.IGNORECASE | re.MULTILINE
+    if re.search(r"^[#*_\s]*(abstract|要旨|概要)\b", head, flags):
+        return PAPER
+    if re.search(r"^[#*_\s]*(1|I)\.?\s+introduction\b", head, flags):
+        return PAPER
+    return DOCUMENT
+
+
+def detect_pdf_mode(pdf_path: str, pages: Optional[Sequence[int]] = None) -> str:
+    import pymupdf
+
+    with pymupdf.open(pdf_path) as doc:
+        numbers = list(pages) if pages is not None else range(doc.page_count)
+        text = "\n".join(doc[i].get_text() for i in list(numbers)[:3])
+    return detect_mode(text)
+
+
+# ------------------------------------------------------------
+# PDF のしおり（目次情報）
+# ------------------------------------------------------------
+@dataclass
+class Chapter:
+    title: str
+    start: int                 # 0 始まりのページ番号
+    end: int                   # この直前のページまで
+    entries: list = field(default_factory=list)   # [(深さ, 見出し)]（章の中のしおり）
+
+
+# 既定では訳さない、本文以外のページ
+_FRONT_BACK_MATTER = re.compile(
+    r"^(cover|title page|copyright|table of contents|contents|index|"
+    r"other books|packt page|about the publisher|advertisement|目次|索引|奥付)\b",
+    re.IGNORECASE,
+)
+
+
+def pdf_chapters(pdf_path: str) -> List[Chapter]:
+    """しおりの一番上の階層を章として返す（しおりの無い PDF なら空）"""
+    import pymupdf
+
+    with pymupdf.open(pdf_path) as doc:
+        toc = [(lv, title.strip(), page - 1) for lv, title, page in doc.get_toc()
+               if page >= 1 and title.strip()]
+        page_count = doc.page_count
+    if not toc:
+        return []
+    top = min(lv for lv, _, _ in toc)
+    chapters: List[Chapter] = []
+    for lv, title, page in toc:
+        if lv == top:
+            if chapters and chapters[-1].start == page:
+                chapters[-1].title += f" / {title}"     # 同じページから始まる章はまとめる
+            else:
+                chapters.append(Chapter(title, page, page_count))
+        elif chapters:
+            chapters[-1].entries.append((lv - top + 1, title))
+        else:
+            chapters.append(Chapter(title, page, page_count, []))
+    for prev, nxt in zip(chapters, chapters[1:]):
+        prev.end = max(nxt.start, prev.start + 1)
+    return chapters
+
+
+def is_body_chapter(chapter: Chapter) -> bool:
+    return not _FRONT_BACK_MATTER.match(chapter.title)
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"[\W_]+", "", text.lower())
+
+
+def apply_outline(blocks: List[Block], chapter: Chapter, offset: int = 1):
+    """見出しの階層を、PDF のしおりに合わせる
+
+    pymupdf4llm は文字の大きさから見出しの階層を決めるため、本1冊を通すと
+    章によって階層がずれたり、小節がすべて同じ深さになったりする。
+    しおりに載っている見出しはしおりの深さを使い、載っていない見出しは直前の見出しの1段下にする。
+    章タイトル（しおりの一番上）は、しおりの書き方（"Chapter 2: ..."）にそろえる。
+    """
+    entries = [(1, chapter.title)] + chapter.entries
+    keys = [_norm(t) for _, t in entries]
+    pos = 0
+    last_level = offset + 1
+    chapter_heading_done = False
+
+    for b in blocks:
+        if b.kind != "heading":
+            continue
+        key = _norm(b.text)
+        match = None
+        if len(key) >= 3:
+            # 同じ名前の見出し（各章の "Technical requirements" など）を取り違えないよう、前から順に探す
+            for i in range(pos, min(pos + 40, len(entries))):
+                if keys[i] == key or (len(key) >= 8 and keys[i].endswith(key)):
+                    match = i
+                    break
+        if match is not None:
+            depth, title = entries[match]
+            pos = match + 1
+            b.level = min(depth + offset, 5)
+            if match == 0:
+                b.text = title.split(" / ")[0]
+                chapter_heading_done = True
+        else:
+            b.level = min(last_level + 1, 5)
+        last_level = b.level
+
+    if not chapter_heading_done:
+        # 章タイトルが本文から取れなかったとき（章の扉が画像など）は、先頭に入れる
+        first = next((i for i, b in enumerate(blocks) if b.kind != "title"), len(blocks))
+        blocks.insert(first, Block("heading", chapter.title.split(" / ")[0],
+                                   level=min(1 + offset, 5)))
 
 
 _MARGIN_CLASSES = ("page-header", "page-footer")
+
+
+def mark_side_notes(boxes):
+    """欄外の小さなアイコンと、その右に並ぶ囲み（Note・Tip など）を見つける
+
+    書籍では、囲みの左の余白にアイコンが置かれていることが多い。pymupdf4llm はこれを
+    図として切り出すため、アイコン（と囲みの文字の切れ端）の画像が大量に混ざってしまう。
+
+    - 本文の左端より左にはみ出した、幅の小さい図で、
+    - その右に高さの重なる文章のブロックがあるもの
+
+    をアイコンとみなし、画像の代わりに囲みの始まり・終わりの目印を入れる。
+    """
+    texts = [b for b in boxes if b.boxclass not in _MARGIN_CLASSES + ("picture", "formula")]
+    if not texts:
+        return boxes
+    left_margin = min(b.x0 for b in texts)
+    body_width = max(b.x1 for b in texts) - left_margin
+
+    out = list(boxes)
+    for icon in [b for b in boxes if b.boxclass == "picture"]:
+        if icon.x1 - icon.x0 > body_width * 0.2 or icon.x0 >= left_margin - 2:
+            continue
+        beside = [b for b in texts
+                  if b.x0 >= icon.x1 - 10 and b.y0 < icon.y1 and b.y1 > icon.y0]
+        if not beside:
+            continue
+        icon.image = NOTE_START
+        icon.textlines = None
+        end = copy.copy(icon)
+        end.image = NOTE_END
+        # 目印で囲みの文章を挟む（同じ値のブロックがあり得るので、位置は is で探す）
+        out = [b for b in out if b is not icon]
+        positions = [i for i, b in enumerate(out) if any(b is x for x in beside)]
+        out.insert(max(positions) + 1, end)
+        out.insert(min(positions), icon)
+    return out
 
 
 def order_two_columns(boxes, page_width):
@@ -165,7 +389,9 @@ _KNOWN_SECTIONS = re.compile(
 _COMMON_SINGLE_WORD_SECTIONS = re.compile(
     r"^(results?|methods?|methodology|implementation|design|overview|motivation|"
     r"summary|analysis|setup|evaluation|discussion|conclusions?|introduction|"
-    r"background|preliminaries|approach|experiments?)$",
+    r"background|preliminaries|approach|experiments?|preface|foreword|exercises?|"
+    r"questions|glossary|contents|index|acknowledge?ments?|appendix|references|"
+    r"prerequisites|requirements|installation|usage|examples?|notes?|tips?)$",
     re.IGNORECASE,
 )
 _REFERENCES = re.compile(r"^(references|bibliography|参考文献)\s*$", re.IGNORECASE)
@@ -209,40 +435,114 @@ _END_OF_SENTENCE = re.compile(r"[.!?:;。．！？)\]”\"']\s*$")
 
 
 def _split_raw_blocks(md: str) -> List[str]:
-    """空行区切り。ただし表（| で始まる行の連続）は1ブロックにまとめる"""
+    """空行区切り。ただし表（| で始まる行の連続）とコード（``` から ``` まで）は1ブロックにまとめる"""
     blocks, current = [], []
+    in_code = False
+
+    def flush():
+        if current:
+            blocks.append("\n".join(current))
+            current.clear()
+
     for line in md.splitlines():
+        if line.lstrip().startswith("```"):
+            if not in_code:
+                flush()
+            current.append(line)
+            in_code = not in_code
+            if not in_code:
+                flush()
+            continue
+        if in_code:
+            current.append(line)    # コードの中の空行は区切りにしない
+            continue
         if not line.strip():
-            if current:
-                blocks.append("\n".join(current))
-                current = []
+            flush()
             continue
         if current and line.lstrip().startswith("|") != current[-1].lstrip().startswith("|"):
-            blocks.append("\n".join(current))
-            current = []
+            flush()
         current.append(line)
-    if current:
-        blocks.append("\n".join(current))
+    flush()
     return blocks
 
 
-def parse_blocks(md: str) -> List[Block]:
+_IMAGE_RE = re.compile(r"!\[[^\]\n]*\]\([^)\s]*\)?")   # 閉じ括弧のない（途中で切れた）画像も含む
+_INLINE_CODE_RE = re.compile(r"`[^`]*`")
+
+
+def _image_src(markdown_image: str) -> str:
+    m = re.search(r"\(([^)\s]*)\)\s*$", markdown_image)
+    return m.group(1) if m else ""
+
+
+def parse_blocks(md: str, mode: str = PAPER, title: Optional[str] = None) -> List[Block]:
+    """Markdown をブロック列にする
+
+    mode=DOCUMENT では title（ファイル名など）を文書の題として先頭に置く。
+    """
     blocks: List[Block] = []
+    document = mode == DOCUMENT
+    in_note = False
+    chapter_number = ""
+
+    if document:
+        if title:
+            blocks.append(Block("title", title, translate=False))
+        # 文中に埋め込まれた画像（base64 を含む）を独立させ、翻訳モデルに送らないようにする
+        md = _IMAGE_RE.sub(lambda m: f"\n\n{m.group(0)}\n\n", md)
 
     for raw in _split_raw_blocks(md):
         stripped = raw.strip()
 
         if stripped.startswith("|"):
-            blocks.append(Block("table", stripped, translate=False))
+            if document:
+                blocks.append(_table_block(stripped))
+            else:
+                blocks.append(Block("table", stripped, translate=False))
             continue
         if stripped.startswith("!["):
+            src = _image_src(stripped)
+            if src in (NOTE_START, NOTE_END):
+                in_note = src == NOTE_START
+                continue
             blocks.append(Block("image", stripped, translate=False))
             continue
         if stripped.startswith("```"):
-            blocks.append(Block("table", stripped, translate=False))  # コードはそのまま
+            prev = blocks[-1] if blocks else None
+            if document and prev and prev.kind == "table" and prev.text.startswith("```"):
+                # ページの境目で切れたコードを1つにつなげる
+                prev.text = prev.text.rstrip()[:-3].rstrip("\n") + "\n" + \
+                    re.sub(r"^```[^\n]*\n?", "", stripped)
+            else:
+                blocks.append(Block("table", stripped, translate=False))  # コードはそのまま
             continue
 
         m = re.match(r"^(#{1,6})\s+(.*)$", stripped, re.DOTALL)
+        if m and document:
+            text = clean_inline(m.group(2).replace("\n", " "))
+            if not text or text.lower() == "blank":
+                continue
+            if re.fullmatch(r"(chapter\s+)?(\d{1,3}|[IVXLC]{1,6})", text, re.IGNORECASE):
+                # 章の扉の大きな章番号（"# 2"）は、続く章タイトルの頭に付ける
+                chapter_number = text
+                continue
+            if not re.search(r"[^\W\d_]{2}", _INLINE_CODE_RE.sub("", text)):
+                # "# `*DOCUMENTATION*`" のような、コードの行が見出しと誤認されたもの
+                blocks.append(Block("para", text, translate=False))
+                continue
+            if re.match(r"^(table|fig(ure)?\.?|listing|表|図)\s*[\dA-Z]+([.\-]\d+)*\b", text,
+                        re.IGNORECASE):
+                # 表・図のキャプションが大きな文字で見出しと誤認されたもの
+                _append_paragraph(blocks, text)
+                continue
+            if chapter_number:
+                text = f"{chapter_number} {text}"
+                chapter_number = ""
+            # 題（title）を # で出すので、題があるときは見出しを1段下げる
+            offset = 1 if title else 0
+            blocks.append(Block("heading", text, level=min(len(m.group(1)) + offset, 5),
+                                translate=_translatable_title(text)))
+            continue
         if m:
             text = clean_inline(m.group(2))
             if not text or text.lower() == "blank":
@@ -281,10 +581,70 @@ def parse_blocks(md: str) -> List[Block]:
 
         text = clean_inline(stripped.replace("\n", " "))
         if text:
-            _append_paragraph(blocks, text)
+            if in_note:
+                blocks.append(Block("quote", text))
+            else:
+                _append_paragraph(blocks, text)
 
-    _mark_untranslated(blocks)
+    if not document:
+        _mark_untranslated(blocks)
     return blocks
+
+
+def _translatable_title(text: str) -> bool:
+    """1語だけの見出し（Rust, GEDF, MRM など）は文脈なしだと誤訳しやすい
+    （例: "Rust" -> 「錆」）ので原文のままにする。よく使われる一般的な章名は訳す"""
+    if len(text.split()) != 1:
+        return True
+    return bool(_KNOWN_SECTIONS.match(text) or _COMMON_SINGLE_WORD_SECTIONS.match(text))
+
+
+# ------------------------------------------------------------
+# 表（書籍・一般文書のみ、文章の入ったセルを訳す）
+# ------------------------------------------------------------
+def _split_row(line: str) -> List[str]:
+    return line.strip().strip("|").split("|")
+
+
+def _cell_text(cell: str) -> str:
+    return clean_inline(re.sub(r"<br\s*/?>", " ", cell))
+
+
+def _is_prose_cell(cell: str) -> bool:
+    """コードや数値ではなく、2語以上の文章が入ったセル"""
+    words = re.findall(r"[^\W\d_]{2,}", _INLINE_CODE_RE.sub("", _cell_text(cell)))
+    return len(words) >= 2
+
+
+def _table_block(md_table: str) -> Block:
+    b = Block("table", md_table)
+    for line in md_table.splitlines():
+        if re.fullmatch(r"\s*\|?[\s:|-]+\|?\s*", line):     # |---|---|
+            continue
+        b.segments += [_cell_text(c) for c in _split_row(line) if _is_prose_cell(c)]
+    # 書籍の目次（"Preface ....... xxiii"、"Cloning a Git tree • 22"）は訳さない
+    leaders = len(re.findall(r"\.{5,}|•\s*\d+", md_table))
+    if leaders >= max(3, md_table.count("\n") // 2):
+        b.segments = []
+    b.translate = bool(b.segments)
+    return b
+
+
+def _render_table(b: Block, translated_cells: List[str]) -> str:
+    cells = iter(translated_cells)
+    lines = []
+    for line in b.text.splitlines():
+        if re.fullmatch(r"\s*\|?[\s:|-]+\|?\s*", line):
+            lines.append(line)
+            continue
+        row = []
+        for c in _split_row(line):
+            if _is_prose_cell(c):
+                t = next(cells, None)
+                c = t.replace("|", "\\|").replace("\n", " ") if t else c
+            row.append(c)
+        lines.append("|" + "|".join(row) + "|")
+    return "\n".join(lines)
 
 
 def _append_paragraph(blocks: List[Block], text: str):
@@ -364,7 +724,12 @@ def translate_blocks(
 ):
     targets = []
     for b in blocks:
-        if b.kind in ("table", "image"):
+        if b.kind == "image":
+            continue
+        if b.kind == "table":
+            # 書籍・一般文書の表は、_table_block で文章のセルを segments に入れてある
+            if b.translate and b.segments:
+                targets.append(b)
             continue
         if not b.translate and not (translate_references and b.in_refs):
             continue
@@ -377,7 +742,10 @@ def translate_blocks(
     i = 0
     for b in targets:
         n = len(b.segments)
-        b.translated = "".join(results[i:i + n]) if n > 1 else results[i]
+        if b.kind == "table":
+            b.translated = _render_table(b, results[i:i + n])
+        else:
+            b.translated = "".join(results[i:i + n]) if n > 1 else results[i]
         i += n
 
 
@@ -423,7 +791,9 @@ def render_markdown(blocks: List[Block], source_name: str, bilingual: bool = Fal
         elif b.kind == "heading":
             out.append(_heading_line(b))
         elif b.kind in ("table", "image"):
-            out.append(b.text)
+            out.append(b.translated or b.text)
+            if b.kind == "table" and bilingual and b.translated:
+                out.append(_original_details(b.text))
         elif b.kind == "list":
             line = f"{b.marker} {b.translated or b.text}"
             # 連続する箇条書きは空行を挟まず1つのリストにする
@@ -434,7 +804,14 @@ def render_markdown(blocks: List[Block], source_name: str, bilingual: bool = Fal
             if bilingual and b.translated:
                 pending_originals.append(b.text)
         elif b.kind == "quote":
-            out.append("> " + (b.translated or b.text))
+            line = "> " + (b.translated or b.text)
+            # 連続する引用（書籍の囲みなど）は1つの引用にまとめる（原文を併記するときは分ける）
+            if prev_kind == "quote" and not bilingual:
+                out[-1] += "\n>\n" + line
+            else:
+                out.append(line)
+            if bilingual and b.translated:
+                out.append(_original_details(b.text))
         else:
             out.append(b.translated or b.text)
             if bilingual and b.translated:
@@ -488,7 +865,14 @@ h4, h5 {{ font-size: 1.02em; margin-top: 1.6em; }}
 h2, h3, h4, h5 {{ scroll-margin-top: 16px; }}
 p {{ margin: 0.9em 0; text-align: justify; }}
 blockquote {{ margin: 1em 0; padding: 4px 14px; border-left: 4px solid var(--line); color: var(--muted); font-size: 0.92em; }}
-img {{ max-width: 100%; height: auto; display: block; margin: 16px auto; background: #fff; border-radius: 4px; }}
+img {{ max-width: 100%; height: auto; display: block; margin: 16px auto; background: #fff; border-radius: 4px;
+  cursor: zoom-in; }}
+pre {{ background: var(--code); padding: 10px 14px; border-radius: 6px; overflow-x: auto; line-height: 1.5; }}
+pre code {{ background: none; padding: 0; font-size: 0.85em; }}
+.zoom {{ position: fixed; inset: 0; background: rgba(0,0,0,.85); display: none; overflow: auto;
+  cursor: zoom-out; z-index: 10; }}
+.zoom.open {{ display: block; }}
+.zoom img {{ max-width: none; margin: 24px auto; cursor: zoom-out; }}
 table {{ border-collapse: collapse; margin: 16px 0; font-size: 0.85em; display: block; overflow-x: auto; }}
 th, td {{ border: 1px solid var(--line); padding: 4px 8px; }}
 th {{ background: var(--side); }}
@@ -512,6 +896,18 @@ details[open] {{ border-left: 3px solid var(--line); padding-left: 12px; }}
 </main>
 </div>
 {toggle}
+<div class="zoom" onclick="this.classList.remove('open')"><img alt=""></div>
+<script>
+// 図をクリックすると原寸で表示する（細かい図を読むため）
+document.querySelectorAll('main img').forEach(img => img.addEventListener('click', () => {{
+  const z = document.querySelector('.zoom');
+  z.querySelector('img').src = img.src;
+  z.classList.add('open');
+}}));
+document.addEventListener('keydown', e => {{
+  if (e.key === 'Escape') document.querySelector('.zoom').classList.remove('open');
+}});
+</script>
 </body>
 </html>
 """

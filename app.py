@@ -190,6 +190,17 @@ def split_text(text, max_chars=2200):
 # ------------------------------------------------------------
 # テキスト翻訳
 # ------------------------------------------------------------
+def is_markdown_document(text):
+    """画像（![](...)）やコード（```）を含む Markdown か。電子書籍の本文やチャットの書き出しなど"""
+    return bool(re.search(r"!\[[^\]\n]*\]\(|^\s*```", text, re.MULTILINE))
+
+
+def _hide_images(md_text):
+    """画面に出すときは、埋め込み画像（base64）を目印に置き換えて軽くする"""
+    # 途中で切れた（閉じ括弧のない）画像も置き換える
+    return re.sub(r"!\[[^\]\n]*\]\(data:[^)\s]*\)?", "*(図)*", md_text)
+
+
 def translate_input_text(text, source_lang, target_lang, form,
                          progress=gr.Progress()):
     if not text or not text.strip():
@@ -197,12 +208,33 @@ def translate_input_text(text, source_lang, target_lang, form,
     if source_lang == target_lang:
         raise gr.Error("翻訳元と翻訳先が同じ言語です。")
 
-    chunks = split_text(text)
-    results = get_backend().translate_many(
-        chunks, source_lang, target_lang, form,
-        progress=lambda done, total: progress(done / total, desc=f"翻訳中 ({done}/{total})"),
+    backend = get_backend()
+
+    def on_progress(done, total):
+        progress(done / total, desc=f"翻訳中 ({done}/{total})")
+
+    if not is_markdown_document(text):
+        chunks = split_text(text)
+        results = backend.translate_many(chunks, source_lang, target_lang, form,
+                                         progress=on_progress)
+        return "\n\n".join(results), None
+
+    # Markdown: 画像・コード・表の記号はそのまま残し、文章だけを訳す
+    blocks = paper.parse_blocks(text, mode=paper.DOCUMENT)
+    paper.translate_blocks(
+        blocks,
+        lambda texts, cb: backend.translate_many(texts, source_lang, target_lang, form, progress=cb),
+        progress=on_progress,
     )
-    return "\n\n".join(results)
+    md_text = paper.render_markdown(blocks, "")
+    output_dir = tempfile.mkdtemp(prefix="plamo_")
+    files = []
+    for ext, content in (("md", md_text), ("html", paper.render_html(md_text, "翻訳結果"))):
+        path = os.path.join(output_dir, f"translated.{ext}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        files.append(path)
+    return _hide_images(md_text), files
 
 
 def swap_languages(source_lang, target_lang, text, translated):
@@ -213,13 +245,117 @@ def swap_languages(source_lang, target_lang, text, translated):
 
 
 # ------------------------------------------------------------
-# PDF翻訳（章ごとの全文訳を Markdown / HTML で出力）
+# PDF・文書翻訳（章ごとの全文訳を Markdown / HTML で出力）
 # ------------------------------------------------------------
-def translate_pdfs(files, source_lang, target_lang, form, formats,
-                   bilingual, with_images, translate_refs,
-                   progress=gr.Progress()):
+DOC_MODES = [("自動判定", "auto"), ("論文", paper.PAPER), ("書籍・一般文書", paper.DOCUMENT)]
+IMAGE_DPI = [("標準（150dpi・軽い）", 150), ("高画質（200dpi）", 200), ("最高画質（300dpi・重い）", 300)]
+
+
+def parse_page_range(text, page_count):
+    """ "37-80, 100" -> 0 始まりのページ番号のリスト。空欄なら None（全ページ）"""
+    if not text or not text.strip():
+        return None
+    pages = []
+    for part in re.split(r"[,、\s]+", text.strip()):
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)?\s*[-~〜]\s*(\d+)?|(\d+)", part)
+        if not m:
+            raise gr.Error(f"ページ範囲を読み取れません: {part}（例: 37-80, 100）")
+        if m.group(3):
+            first = last = int(m.group(3))
+        else:
+            first = int(m.group(1) or 1)
+            last = int(m.group(2) or page_count)
+        if first < 1 or last > page_count or first > last:
+            raise gr.Error(f"ページ範囲が文書の外です: {part}（全 {page_count} ページ）")
+        pages += [p for p in range(first - 1, last) if p not in pages]
+    return pages
+
+
+def _is_pdf(path):
+    return path.lower().endswith(".pdf")
+
+
+def book_chapters(path, mode):
+    """書籍として扱う PDF なら、しおりの章の一覧を返す（論文・しおりの無い PDF は空）"""
+    if not _is_pdf(path):
+        return []
+    chapters = paper.pdf_chapters(path)
+    if len(chapters) < 3:
+        return []
+    if mode == paper.PAPER or (mode == "auto" and paper.detect_pdf_mode(path) == paper.PAPER):
+        return []
+    return chapters
+
+
+def show_chapters(files, mode):
+    """ファイルを選んだときに、訳す章の選択肢を出す（PDF 1つのときだけ）"""
+    hidden = (gr.update(choices=[], value=[], visible=False), gr.update(visible=False))
+    if not files or len(files) != 1:
+        return hidden
+    chapters = book_chapters(files[0], mode)
+    if not chapters:
+        return hidden
+    choices = [(f"{c.title}（{c.start + 1}〜{c.end} ページ）", str(i))
+               for i, c in enumerate(chapters)]
+    selected = [str(i) for i, c in enumerate(chapters) if paper.is_body_chapter(c)]
+    return (gr.update(choices=choices, value=selected, visible=True),
+            gr.update(visible=True))
+
+
+def load_units(path, mode, page_range, chapter_ids, with_images, image_dpi, stem):
+    """ファイルを読み、(出力の単位のリスト, 文書の種類) を返す
+
+    出力の単位は (ファイル名に付ける名前, ブロック列)。書籍の PDF で章を選んだときは章ごと、
+    それ以外はファイル全体で1つ。
+    """
+    if not _is_pdf(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            md_source = f.read()
+        doc_mode = paper.detect_mode(md_source) if mode == "auto" else mode
+        return [("", paper.parse_blocks(md_source, mode=doc_mode, title=stem))], doc_mode
+
+    import pymupdf
+    with pymupdf.open(path) as doc:
+        page_count = doc.page_count
+        # PDF に題名が入っていればそれを文書の題にする（無ければファイル名）
+        stem = (doc.metadata or {}).get("title", "").strip() or stem
+    pages = parse_page_range(page_range, page_count)
+    chapters = book_chapters(path, mode) if pages is None else []
+
+    if chapters:
+        selected = [chapters[int(i)] for i in (chapter_ids or []) if int(i) < len(chapters)]
+        if not selected:
+            raise gr.Error("訳す章を1つ以上選んでください。")
+        units = []
+        for n, ch in enumerate(selected):
+            md_source = paper.pdf_to_markdown(
+                path, with_images=with_images, mode=paper.DOCUMENT,
+                pages=range(ch.start, ch.end), image_dpi=int(image_dpi),
+            )
+            blocks = paper.parse_blocks(md_source, mode=paper.DOCUMENT, title=stem)
+            paper.apply_outline(blocks, ch)
+            units.append((f"{n + 1:02d}_{_slug(ch.title)}", blocks))
+        return units, paper.DOCUMENT
+
+    doc_mode = paper.detect_pdf_mode(path, pages) if mode == "auto" else mode
+    md_source = paper.pdf_to_markdown(path, with_images=with_images, mode=doc_mode,
+                                      pages=pages, image_dpi=int(image_dpi))
+    return [("", paper.parse_blocks(md_source, mode=doc_mode, title=stem))], doc_mode
+
+
+def _slug(title, max_len=40):
+    """ファイル名に使える短い名前にする（"Chapter 2: Building ..." -> "Chapter_2_Building"）"""
+    slug = re.sub(r"[^\w]+", "_", title).strip("_")
+    return slug[:max_len].rstrip("_") or "part"
+
+
+def translate_files(files, source_lang, target_lang, form, formats,
+                    bilingual, with_images, translate_refs, mode, page_range, image_dpi,
+                    chapter_ids, split_chapters, progress=gr.Progress()):
     if not files:
-        raise gr.Error("PDFを選択してください。")
+        raise gr.Error("ファイルを選択してください。")
     if not formats:
         raise gr.Error("出力形式を1つ以上選んでください。")
     backend = get_backend()
@@ -228,16 +364,21 @@ def translate_pdfs(files, source_lang, target_lang, form, formats,
     output_files = []
     preview = ""
 
-    for n, pdf_path in enumerate(files):
-        name = os.path.basename(pdf_path)
+    for n, path in enumerate(files):
+        name = os.path.basename(path)
         stem = os.path.splitext(name)[0]
         prefix = f"[{n + 1}/{len(files)}] {name}"
 
-        progress(0, desc=f"{prefix}: 本文を抽出中")
-        md_source = paper.pdf_to_markdown(pdf_path, with_images=with_images)
-        blocks = paper.parse_blocks(md_source)
+        progress(0, desc=f"{prefix}: 本文を抽出中（書籍1冊では数分かかります）")
+        units, doc_mode = load_units(path, mode, page_range, chapter_ids if len(files) == 1 else None,
+                                     with_images, image_dpi, stem)
+        if not split_chapters and len(units) > 1:
+            # 選んだ章を1つのファイルにまとめる（題は先頭の1つだけ残す）
+            merged = units[0][1] + [b for _, blocks in units[1:] for b in blocks if b.kind != "title"]
+            units = [("", merged)]
 
-        if not any(b.text for b in blocks if b.kind not in ("table", "image")):
+        all_blocks = [b for _, blocks in units for b in blocks]
+        if not any(b.text for b in all_blocks if b.kind not in ("title", "heading", "table", "image")):
             raise gr.Error(
                 f"{name}: テキストを抽出できませんでした（スキャン画像のPDFはOCRが必要です）。"
             )
@@ -245,8 +386,9 @@ def translate_pdfs(files, source_lang, target_lang, form, formats,
         def on_progress(done, total):
             progress(done / total, desc=f"{prefix}: 翻訳中 ({done}/{total} 段落)")
 
+        # 章ごとに分けて出す場合も、翻訳は全章まとめて投げる（vLLM で並列に処理できる）
         paper.translate_blocks(
-            blocks,
+            all_blocks,
             lambda texts, cb: backend.translate_many(
                 texts, source_lang, target_lang, form, progress=cb
             ),
@@ -254,30 +396,37 @@ def translate_pdfs(files, source_lang, target_lang, form, formats,
             progress=on_progress,
         )
 
-        md_text = paper.render_markdown(blocks, name, bilingual=bilingual)
-        title = next((b.translated or b.text for b in blocks if b.kind == "title"), stem)
+        for unit_name, blocks in units:
+            md_text = paper.render_markdown(blocks, name, bilingual=bilingual)
+            title = next((b.translated or b.text for b in blocks if b.kind == "title"), stem)
+            if unit_name:
+                chapter = next((b for b in blocks if b.kind == "heading"), None)
+                if chapter:
+                    title = f"{chapter.translated or chapter.text} - {title}"
+            base = f"{stem}_{unit_name}_ja" if unit_name else f"{stem}_ja"
 
-        if "Markdown" in formats:
-            path = os.path.join(output_dir, f"{stem}_ja.md")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(md_text)
-            output_files.append(path)
+            if "Markdown" in formats:
+                out = os.path.join(output_dir, f"{base}.md")
+                with open(out, "w", encoding="utf-8") as f:
+                    f.write(md_text)
+                output_files.append(out)
 
-        if "HTML" in formats:
-            path = os.path.join(output_dir, f"{stem}_ja.html")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(paper.render_html(md_text, title))
-            output_files.append(path)
+            if "HTML" in formats:
+                out = os.path.join(output_dir, f"{base}.html")
+                with open(out, "w", encoding="utf-8") as f:
+                    f.write(paper.render_html(md_text, title))
+                output_files.append(out)
 
-        if not preview:
-            # 画面のプレビューは画像を除いて軽くする
-            preview = re.sub(r"!\[[^\]]*\]\(data:[^)]*\)", "*(図)*", md_text)
+            if not preview:
+                # 画面のプレビューは画像を除いて軽くする
+                kind = "論文" if doc_mode == paper.PAPER else "書籍・一般文書"
+                preview = f"*（{kind}として処理）*\n\n" + _hide_images(md_text)
 
-    if len(files) > 1:
-        zip_path = os.path.join(output_dir, "translated_papers.zip")
+    if len(output_files) > 2:
+        zip_path = os.path.join(output_dir, "translated_files.zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-            for path in output_files:
-                z.write(path, os.path.basename(path))
+            for out in output_files:
+                z.write(out, os.path.basename(out))
         output_files = [zip_path] + output_files
 
     return output_files, preview
@@ -298,7 +447,7 @@ with gr.Blocks(title="PLaMo Translator") as demo:
         # PLaMo 3 Translate
         ### Local Translator
 
-        ローカル環境で文章・PDF論文を翻訳します。
+        ローカル環境で文章・PDF（論文・書籍など）を翻訳します。
         """
     )
 
@@ -340,10 +489,18 @@ with gr.Blocks(title="PLaMo Translator") as demo:
             swap_button = gr.Button("⇄ 言語を入れ替え")
             text_button = gr.Button("翻訳", variant="primary")
 
+        gr.Markdown(
+            "画像（`![](...)`）やコード（` ``` `）を含む Markdown"
+            "（電子書籍の本文やAIとのチャットをコピーしたものなど）は、画像・コードを残したまま"
+            "文章だけを訳します。訳文欄では画像を *(図)* と表示し、画像入りの訳文は下の"
+            "ファイル（Markdown / HTML）に保存します。"
+        )
+        text_files = gr.File(label="画像入りの訳文", file_count="multiple", visible=True)
+
         text_button.click(
             fn=translate_input_text,
             inputs=[text_input, t_source, t_target, t_form],
-            outputs=[text_output]
+            outputs=[text_output, text_files]
         )
         swap_button.click(
             fn=swap_languages,
@@ -351,12 +508,32 @@ with gr.Blocks(title="PLaMo Translator") as demo:
             outputs=[t_source, t_target, text_input, text_output]
         )
 
-    with gr.Tab("PDF翻訳"):
+    with gr.Tab("PDF・文書翻訳"):
         gr.Markdown(
-            "論文の章立て（1 / 1.1 / I. / A. など）を保ったまま全文訳を出力します。"
-            "著者・所属と参考文献は原文のまま残します。"
+            "章立てを保ったまま全文訳を HTML / Markdown で出力します。\n\n"
+            "- **論文**: 章番号（1 / 1.1 / I. / A. など）の付いた見出しを章とみなし、"
+            "著者・所属と参考文献は原文のまま残します。\n"
+            "- **書籍・一般文書**（電子書籍・AIとのチャットの書き出しなど）: 文字の大きさから見出しを判定し、"
+            "表の中の文章も含めて全文を訳します。欄外にアイコンの付いた囲み（Note など）は引用として出します。\n"
+            "- PDF のほか、Markdown（.md）・テキスト（.txt）も読み込めます。"
         )
         p_source, p_target, p_form = language_controls("en", "ja")
+
+        with gr.Row():
+            p_mode = gr.Radio(DOC_MODES, value="auto", label="文書の種類")
+            p_pages = gr.Textbox(
+                label="ページ範囲（PDFのみ・空欄で全ページ。指定すると章の選択より優先）",
+                placeholder="例: 37-80, 100",
+            )
+            p_dpi = gr.Dropdown(IMAGE_DPI, value=200, label="図の解像度")
+
+        # 書籍の PDF（しおり付き）を1つ選んだときだけ出す
+        p_chapters = gr.CheckboxGroup(
+            [], label="訳す章（PDFのしおりから。表紙・目次・索引などは最初から外しています）",
+            visible=False,
+        )
+        p_split = gr.Checkbox(True, label="章ごとにファイルを分ける（ZIPにもまとめます）",
+                              visible=False)
 
         with gr.Row():
             p_formats = gr.CheckboxGroup(
@@ -364,12 +541,12 @@ with gr.Blocks(title="PLaMo Translator") as demo:
             )
             p_bilingual = gr.Checkbox(False, label="段落ごとに原文を併記（折りたたみ）")
             p_images = gr.Checkbox(True, label="図を埋め込む")
-            p_refs = gr.Checkbox(False, label="参考文献も翻訳する")
+            p_refs = gr.Checkbox(False, label="参考文献も翻訳する（論文）")
 
         pdf_input = gr.File(
-            label="翻訳するPDFを選択",
+            label="翻訳するファイルを選択（PDF / Markdown / テキスト）",
             file_count="multiple",
-            file_types=[".pdf"],
+            file_types=[".pdf", ".md", ".markdown", ".txt"],
             type="filepath"
         )
 
@@ -386,10 +563,14 @@ with gr.Blocks(title="PLaMo Translator") as demo:
         with gr.Accordion("プレビュー（1本目）", open=False):
             preview_md = gr.Markdown()
 
+        for event in (pdf_input.change, p_mode.change):
+            event(show_chapters, inputs=[pdf_input, p_mode], outputs=[p_chapters, p_split])
+
         translate_button.click(
-            fn=translate_pdfs,
+            fn=translate_files,
             inputs=[pdf_input, p_source, p_target, p_form, p_formats,
-                    p_bilingual, p_images, p_refs],
+                    p_bilingual, p_images, p_refs, p_mode, p_pages, p_dpi,
+                    p_chapters, p_split],
             outputs=[output_file, preview_md]
         )
 
