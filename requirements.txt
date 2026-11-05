@@ -1,0 +1,29 @@
+# PyTorch (CUDA 12.6 版) は PyPI ではなく PyTorch の配布元から入れる
+#   pip install -r requirements.txt
+# だけで CUDA 版が入るように、取得先を追加している。
+# 別の CUDA 版が必要なら https://pytorch.org/get-started/locally/ を参照して cu126 を書き換える。
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+# 動作確認したバージョン（Ubuntu 24.04 / WSL2 / RTX 4060 Laptop 8GB / Python 3.12）
+torch==2.6.0+cu126
+transformers==5.22.1
+accelerate==1.15.0
+safetensors==0.8.0
+
+# PLaMo のトークナイザーが使う
+numba==0.68.1
+
+# 4bit/8bit 量子化（quantize.py と量子化済みモデルの読み込み）
+bitsandbytes==0.50.2
+
+# GUI
+gradio==6.31.0
+
+# PDF -> Markdown（章立ての抽出）と HTML 出力
+pymupdf==2.1
+pymupdf4llm==2.1
+pymupdf_layout==2.1
+markdown-it-py==4.2.0
+
+# モデルのダウンロード（hf コマンド）
+huggingface_hub==2.4.0
