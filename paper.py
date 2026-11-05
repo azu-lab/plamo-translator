@@ -36,14 +36,100 @@ class Block:
 # PDF -> Markdown
 # ------------------------------------------------------------
 def pdf_to_markdown(pdf_path: str, with_images: bool = True) -> str:
-    return pymupdf4llm.to_markdown(
-        pdf_path,
+    options = dict(
         use_ocr=False,        # テキストを持つPDFならOCR不要（遅い）
-        header=False,         # ページヘッダー・フッターを除く
-        footer=False,
         embed_images=with_images,
         show_progress=False,
     )
+    try:
+        # pymupdf4llm の解析結果（ページごとのブロック）を受け取り、
+        # 2カラムの読み順を直してから Markdown にする
+        from pymupdf4llm.helpers import document_layout
+
+        parsed = document_layout.parse_document(pdf_path, force_text=True, **options)
+        for page in parsed.pages:
+            page.boxes = order_two_columns(page.boxes, page.width)
+        return parsed.to_markdown(
+            header=False,     # ページヘッダー・フッターを除く
+            footer=False,
+            embed_images=with_images,
+            show_progress=False,
+        )
+    except (ImportError, AttributeError, TypeError):
+        # pymupdf4llm の内部APIが変わった場合は、読み順の補正なしで変換する
+        return pymupdf4llm.to_markdown(pdf_path, header=False, footer=False, **options)
+
+
+_MARGIN_CLASSES = ("page-header", "page-footer")
+
+
+def order_two_columns(boxes, page_width):
+    """2カラムのページで、ブロックを「左カラム → 右カラム」の順に並べ直す
+
+    pymupdf4llm は、左右のカラムの段落を高さ順に交互に並べてしまうことがある
+    （論文の1ページ目で、左にAbstract、右にIntroductionがあるときなど）。
+
+    - 横幅いっぱいのブロック（タイトル・著者欄・2カラムにまたがる図表）と、
+      それに高さが重なるブロックは「帯」として、上から順・左から順に置く
+    - 帯と帯のあいだは、左カラムを上から下へ、続いて右カラムを上から下へ置く
+    - 2カラムと判定できないページは元の順番のまま返す
+    """
+    mid = page_width / 2
+    tol = page_width * 0.05
+
+    def is_left(b):
+        return b.x1 <= mid + tol
+
+    def is_right(b):
+        return b.x0 >= mid - tol
+
+    body = [b for b in boxes if b.boxclass not in _MARGIN_CLASSES]
+    headers = [b for b in boxes if b.boxclass == "page-header"]
+    footers = [b for b in boxes if b.boxclass == "page-footer"]
+
+    # 左右それぞれに2つ以上ブロックがあるページだけを2カラムとみなす
+    if sum(map(is_left, body)) < 2 or sum(map(is_right, body)) < 2:
+        return boxes
+
+    # 横幅いっぱいのブロックから「帯」（高さの範囲）を作る
+    bands = []
+    for b in sorted((b for b in body if not is_left(b) and not is_right(b)),
+                    key=lambda b: b.y0):
+        if bands and b.y0 <= bands[-1][1]:
+            bands[-1][1] = max(bands[-1][1], b.y1)
+        else:
+            bands.append([b.y0, b.y1])
+
+    def band_of(b):
+        """ブロックが帯と高さで半分以上重なれば、その帯の番号を返す"""
+        height = max(b.y1 - b.y0, 1e-6)
+        for i, (y0, y1) in enumerate(bands):
+            if min(b.y1, y1) - max(b.y0, y0) >= height / 2:
+                return i
+        return None
+
+    # 帯（i）と、帯 i の直前の区間（"gap", i）にブロックを振り分ける。
+    # 最後の帯より下は ("gap", len(bands))
+    groups = {}
+    for b in body:
+        i = band_of(b)
+        if i is not None:
+            key = (i, 1)
+        else:
+            gap = sum(1 for y0, _ in bands if y0 <= b.y0)
+            key = (gap, 0)
+        groups.setdefault(key, []).append(b)
+
+    ordered = []
+    for key in sorted(groups):
+        members = groups[key]
+        if key[1] == 1:   # 帯: 上から順、同じ高さなら左から
+            ordered += sorted(members, key=lambda b: (round(b.y0), b.x0))
+        else:             # 帯のあいだ: 左カラム → 右カラム
+            ordered += sorted((b for b in members if is_left(b)), key=lambda b: b.y0)
+            ordered += sorted((b for b in members if not is_left(b)), key=lambda b: b.y0)
+
+    return headers + ordered + footers
 
 
 # ------------------------------------------------------------
@@ -72,6 +158,14 @@ _KNOWN_SECTIONS = re.compile(
     r"^(abstract|introduction|related works?|background|preliminar(y|ies)|"
     r"conclusions?|discussion|evaluation|experiments?|references|bibliography|"
     r"acknowledge?ments?|appendix|appendices|future work|limitations)\b",
+    re.IGNORECASE,
+)
+# 1語だけの見出しは原則として訳さない（固有名詞の誤訳を防ぐ）が、
+# 論文でよく使われる一般的な章名は訳す
+_COMMON_SINGLE_WORD_SECTIONS = re.compile(
+    r"^(results?|methods?|methodology|implementation|design|overview|motivation|"
+    r"summary|analysis|setup|evaluation|discussion|conclusions?|introduction|"
+    r"background|preliminaries|approach|experiments?)$",
     re.IGNORECASE,
 )
 _REFERENCES = re.compile(r"^(references|bibliography|参考文献)\s*$", re.IGNORECASE)
@@ -161,7 +255,9 @@ def parse_blocks(md: str) -> List[Block]:
                 level, number, title = heading
                 # 1語だけの見出し（Rust, GEDF, MRM など）は文脈なしだと誤訳しやすい
                 # （例: "Rust" -> 「錆」）ので原文のままにする
-                single_word = len(title.split()) == 1 and not _KNOWN_SECTIONS.match(title)
+                single_word = (len(title.split()) == 1
+                               and not _KNOWN_SECTIONS.match(title)
+                               and not _COMMON_SINGLE_WORD_SECTIONS.match(title))
                 blocks.append(Block("heading", title, level=level, number=number,
                                     translate=not single_word))
             else:
