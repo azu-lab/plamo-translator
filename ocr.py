@@ -37,19 +37,37 @@ def ocr_available() -> bool:
     return OCR_PYTHON.exists() and (OCR_MODEL / "config.json").is_file()
 
 
-def find_scanned_pages(pdf_path: str, pages: Optional[Sequence[int]] = None) -> List[int]:
-    """文字をほとんど持たず、画像のあるページ（スキャンしたページ）を返す"""
+def _is_scanned(page) -> bool:
     import pymupdf
 
-    scanned = []
+    if len(page.get_text().strip()) < 30:
+        return bool(page.get_images() or page.get_drawings())
+    # 出版社のダウンロード透かし（余白の "Downloaded from ... by [IP]" など）だけ文字を持ち、
+    # 本文はページ全体を覆う画像、というスキャン PDF がある。大きな画像の上に文字がほとんど
+    # 無ければスキャンしたページとみなす
+    area = page.rect.width * page.rect.height
+    big = [pymupdf.Rect(info["bbox"]) for info in page.get_image_info()
+           if pymupdf.Rect(info["bbox"]).get_area() >= area * 0.3]
+    if not big:
+        return False
+    on_image = off_image = 0
+    for w in page.get_text("words"):
+        center = pymupdf.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2)
+        if any(center in r for r in big):
+            on_image += len(w[4])
+        else:
+            off_image += len(w[4])
+    # 画像の外に本文がある（大きな図と本文が並んだページ）なら、文字のあるページとして扱う
+    return on_image < 30 and off_image < 200
+
+
+def find_scanned_pages(pdf_path: str, pages: Optional[Sequence[int]] = None) -> List[int]:
+    """本文が画像になっているページ（スキャンしたページ）を返す"""
+    import pymupdf
+
     with pymupdf.open(pdf_path) as doc:
-        for i in (pages if pages is not None else range(doc.page_count)):
-            page = doc[i]
-            if len(page.get_text().strip()) >= 30:
-                continue
-            if page.get_images() or page.get_drawings():
-                scanned.append(i)
-    return scanned
+        return [i for i in (pages if pages is not None else range(doc.page_count))
+                if _is_scanned(doc[i])]
 
 
 def gpu_free_mib() -> Optional[int]:
