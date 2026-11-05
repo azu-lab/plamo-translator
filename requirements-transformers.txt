@@ -1,0 +1,17 @@
+# vLLM を使わずに、アプリのプロセス内で Transformers によって翻訳する場合だけ必要。
+# アプリと同じ仮想環境 (.venv) に追加で入れる:
+#   pip install -r requirements-transformers.txt
+#
+# PyTorch (CUDA 12.6 版) は PyPI ではなく PyTorch の配布元から入れる。
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+torch==2.6.0+cu126
+transformers==5.22.1
+accelerate==1.15.0
+safetensors==0.8.0
+
+# PLaMo のトークナイザーが使う
+numba==0.68.1
+
+# 4bit/8bit 量子化（quantize.py と量子化済みモデルの読み込み）
+bitsandbytes==0.50.2

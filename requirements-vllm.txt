@@ -1,0 +1,20 @@
+# vLLM 翻訳サーバー用。アプリとは別の仮想環境 (.venv-vllm) に入れる:
+#   python3 -m venv .venv-vllm
+#   .venv-vllm/bin/pip install -r requirements-vllm.txt
+#
+# なぜこの組み合わせか（詳細は BENCHMARK.md）:
+# - PyPI の最新 vLLM (0.33.0) は CUDA 13 版のみで、CUDA 12.x までのドライバ（例: 566.24）では動かない。
+#   そのため GitHub リリースにある CUDA 12.9 版の 0.32.0 を使う（0.32.0 も PLaMo 3 に対応済み）。
+# - torch / torchcodec も CUDA 12.9 版を PyTorch の配布元から入れる。
+#   torchcodec は PyPI 版（CUDA 13）だと vLLM の import 時に libnvrtc.so.13 が無いと言って落ちる。
+# - アプリ側（transformers 5.22）とは transformers / torch の版が衝突するので仮想環境を分けている。
+--extra-index-url https://download.pytorch.org/whl/cu129
+
+vllm @ https://github.com/vllm-project/vllm/releases/download/v0.32.0/vllm-0.32.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl
+torch==2.13.0+cu129
+torchvision==0.28.0+cu129
+torchaudio==2.11.0+cu129
+torchcodec==0.16.0+cu129
+
+# PLaMo のトークナイザーが使う
+numba==0.65.0

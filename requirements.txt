@@ -1,23 +1,12 @@
-# PyTorch (CUDA 12.6 版) は PyPI ではなく PyTorch の配布元から入れる
-#   pip install -r requirements.txt
-# だけで CUDA 版が入るように、取得先を追加している。
-# 別の CUDA 版が必要なら https://pytorch.org/get-started/locally/ を参照して cu126 を書き換える。
---extra-index-url https://download.pytorch.org/whl/cu126
+# アプリ本体（GUI・PDF処理）。翻訳エンジンは別に入れる:
+#   推奨: vLLM サーバー        -> requirements-vllm.txt（別の仮想環境 .venv-vllm に入れる）
+#   代替: Transformers で直接  -> requirements-transformers.txt（この .venv に追加で入れる）
+#
+# 動作確認したバージョン（Ubuntu 24.04 / WSL2 / Python 3.12）
 
-# 動作確認したバージョン（Ubuntu 24.04 / WSL2 / RTX 4060 Laptop 8GB / Python 3.12）
-torch==2.6.0+cu126
-transformers==5.22.1
-accelerate==1.15.0
-safetensors==0.8.0
-
-# PLaMo のトークナイザーが使う
-numba==0.68.1
-
-# 4bit/8bit 量子化（quantize.py と量子化済みモデルの読み込み）
-bitsandbytes==0.50.2
-
-# GUI
+# GUI（vLLM サーバーとの通信に使う httpx も一緒に入る）
 gradio==6.31.0
+httpx==0.28.1
 
 # PDF -> Markdown（章立ての抽出）と HTML 出力
 pymupdf==2.1

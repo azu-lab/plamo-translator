@@ -1,6 +1,9 @@
 # 仮想環境（README の手順で各自作成する）
 /.venv/
+/.venv-vllm/
 /.venv/*
+/.venv-vllm/
+/.venv-vllm/*
 
 # モデルの重み（README の手順で Hugging Face からダウンロード・量子化する）
 # PLaMo Community License のモデルなので、このリポジトリには含めない
