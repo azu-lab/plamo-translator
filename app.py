@@ -5,12 +5,14 @@ import re
 import signal
 import sys
 import threading
+import time
 import zipfile
 import tempfile
 
 import gradio as gr
 
 import ocr
+from detect_lang import detect_language
 import paper
 from backends import TransformersBackend, VllmBackend, VllmServer, find_vllm_models
 
@@ -279,11 +281,47 @@ def translate_input_text(text, source_lang, target_lang, form,
     return _hide_images(md_text), files
 
 
-def swap_languages(source_lang, target_lang, text, translated):
-    # 自動判定は翻訳先にできないので、そのときは入れ替えない
+LANGUAGE_NAMES = dict((code, name) for name, code in LANGUAGES)
+
+
+def source_label(detected=None):
+    """翻訳元の欄の見出し。自動判定のときは判定した言語を添える"""
+    if detected:
+        return f"翻訳元（判定: {LANGUAGE_NAMES[detected]}）"
+    return "翻訳元"
+
+
+def auto_translate_text(text, source_lang, target_lang, form, progress=gr.Progress()):
+    """入力・言語・文体が変わるたびに呼ぶ（翻訳ボタンは無い）
+
+    空欄なら訳文も消す。翻訳エンジンの起動中は、起動が終わるまで待ってから訳す
+    （入力のたびにエラーを出さないため）。
+    翻訳元が「自動判定」のときは原文の言語を判定し、翻訳元の見出しに出して、⇄ の入れ替えに使う。
+    戻り値: 訳文, 画像入りの訳文ファイル, 翻訳元の欄の更新, 判定した言語
+    """
+    detected = detect_language(text) if source_lang == "auto" and text else None
+    label = gr.update(label=source_label(detected))
+    if not text or not text.strip():
+        return "", None, label, None
+    if source_lang == target_lang:
+        raise gr.Error("翻訳元と翻訳先が同じ言語です。")
+    if vllm_server is not None:
+        deadline = time.time() + vllm_server.startup_timeout
+        while vllm_server.state == "starting" and time.time() < deadline:
+            progress(0, desc="翻訳モデルの起動を待っています")
+            time.sleep(1)
+    translated, files = translate_input_text(text, source_lang, target_lang, form, progress)
+    return translated, files, label, detected
+
+
+def swap_languages(source_lang, target_lang, text, translated, detected):
+    """翻訳の向きと原文・訳文を入れ替える。自動判定のときは判定した言語を翻訳元として確定させる"""
     if source_lang == "auto":
-        return source_lang, target_lang, text, translated
-    return target_lang, source_lang, translated, text
+        if not detected:
+            # まだ判定していない（原文が空など）ときは入れ替えない
+            return gr.update(), target_lang, text, translated, None
+        source_lang = detected
+    return gr.update(value=target_lang, label=source_label()), source_lang, translated, text, None
 
 
 # ------------------------------------------------------------
@@ -441,7 +479,7 @@ def _slug(title, max_len=40):
 
 def translate_files(files, source_lang, target_lang, form, formats,
                     bilingual, with_images, translate_refs, mode, page_range, image_dpi,
-                    chapter_ids, split_chapters, use_ocr=False, progress=gr.Progress()):
+                    chapter_ids, split_chapters, progress=gr.Progress()):
     if not files:
         raise gr.Error("ファイルを選択してください。")
     if not formats:
@@ -463,7 +501,7 @@ def translate_files(files, source_lang, target_lang, form, formats,
                      desc=f"{prefix}: スキャンしたページを OCR 中 ({done}/{total} ページ、1 ページ約 40 秒)")
 
         units, doc_mode = load_units(path, mode, page_range, chapter_ids if len(files) == 1 else None,
-                                     with_images, image_dpi, stem, use_ocr, on_ocr_progress)
+                                     with_images, image_dpi, stem, True, on_ocr_progress)
         if not split_chapters and len(units) > 1:
             # 選んだ章を1つのファイルにまとめる（題は先頭の1つだけ残す）
             merged = units[0][1] + [b for _, blocks in units[1:] for b in blocks if b.kind != "title"]
@@ -471,7 +509,7 @@ def translate_files(files, source_lang, target_lang, form, formats,
 
         all_blocks = [b for _, blocks in units for b in blocks]
         if not any(b.text for b in all_blocks if b.kind not in ("title", "heading", "table", "image")):
-            hint = ("「スキャンしたページを OCR する」をオンにしてください。" if ocr.ocr_available()
+            hint = ("" if ocr.ocr_available()
                     else "スキャンした PDF は OCR が必要です（README の「スキャンした PDF を読む」を参照）。")
             raise gr.Error(f"{name}: テキストを抽出できませんでした。{hint}")
 
@@ -564,22 +602,21 @@ with gr.Blocks(title="PLaMo Translator") as demo:
 
     with gr.Tab("テキスト翻訳"):
         t_source, t_target, t_form = language_controls("auto", "ja")
+        t_detected = gr.State(None)     # 自動判定で判定した原文の言語（⇄ の入れ替えに使う）
 
-        with gr.Row():
+        with gr.Row(elem_id="text-row"):
             text_input = gr.Textbox(
                 label="原文",
                 lines=14,
-                placeholder="翻訳したい文章を入力してください"
+                placeholder="翻訳したい文章を入力すると、そのまま訳します"
             )
+            # 原文と訳文の間に置く入れ替えボタン（言語と文章を入れ替える）
+            swap_button = gr.Button("⇄", elem_id="swap-button", scale=0, min_width=48)
             text_output = gr.Textbox(
                 label="訳文",
                 lines=14,
                 buttons=["copy"]
             )
-
-        with gr.Row():
-            swap_button = gr.Button("⇄ 言語を入れ替え")
-            text_button = gr.Button("翻訳", variant="primary")
 
         gr.Markdown(
             "画像（`![](...)`）やコード（` ``` `）を含む Markdown"
@@ -589,15 +626,20 @@ with gr.Blocks(title="PLaMo Translator") as demo:
         )
         text_files = gr.File(label="画像入りの訳文", file_count="multiple", visible=True)
 
-        text_button.click(
-            fn=translate_input_text,
-            inputs=[text_input, t_source, t_target, t_form],
-            outputs=[text_output, text_files]
-        )
+        # 入力したらすぐ訳す。翻訳中にさらに入力したら、終わったあとに最新の内容で1回だけ訳し直す
+        # （.input はユーザーの操作だけで起きるので、入れ替えボタンでは訳し直さない）
+        for event in (text_input.input, t_source.input, t_target.input, t_form.input):
+            event(
+                fn=auto_translate_text,
+                inputs=[text_input, t_source, t_target, t_form],
+                outputs=[text_output, text_files, t_source, t_detected],
+                trigger_mode="always_last",
+                show_progress="minimal",
+            )
         swap_button.click(
             fn=swap_languages,
-            inputs=[t_source, t_target, text_input, text_output],
-            outputs=[t_source, t_target, text_input, text_output]
+            inputs=[t_source, t_target, text_input, text_output, t_detected],
+            outputs=[t_source, t_target, text_input, text_output, t_detected]
         )
 
     with gr.Tab("PDF・文書翻訳"):
@@ -626,20 +668,11 @@ with gr.Blocks(title="PLaMo Translator") as demo:
         )
         p_split = gr.Checkbox(True, label="章ごとにファイルを分ける（ZIPにもまとめます）",
                               visible=False)
-        p_ocr = gr.Checkbox(
-            ocr.ocr_available(),
-            label="スキャンしたページ（文字を持たないページ）を OCR する（Unlimited-OCR・1 ページ約 40 秒）",
-            info=("OCR のあいだは翻訳エンジンを止めて GPU を空けるので、前後に 1 分ほど余分にかかります。"
-                  if ocr.ocr_available() else
-                  "使うには .venv-ocr と model-ocr が必要です（README の「スキャンした PDF を読む」）。"),
-            interactive=ocr.ocr_available(),
-        )
-
         with gr.Row():
             p_formats = gr.CheckboxGroup(
                 ["HTML", "Markdown"], value=["HTML", "Markdown"], label="出力形式"
             )
-            p_bilingual = gr.Checkbox(False, label="段落ごとに原文を併記（折りたたみ）")
+            p_bilingual = gr.Checkbox(True, label="段落ごとに原文を併記（折りたたみ）")
             p_images = gr.Checkbox(True, label="図を埋め込む")
             p_refs = gr.Checkbox(False, label="参考文献も翻訳する（論文）")
 
@@ -670,16 +703,16 @@ with gr.Blocks(title="PLaMo Translator") as demo:
             fn=translate_files,
             inputs=[pdf_input, p_source, p_target, p_form, p_formats,
                     p_bilingual, p_images, p_refs, p_mode, p_pages, p_dpi,
-                    p_chapters, p_split, p_ocr],
+                    p_chapters, p_split],
             outputs=[output_file, preview_md]
         )
 
 
     # モデルの切り替え: 実行中は翻訳ボタンを押せないようにして、終わったら戻す
-    _locked = [model_select, switch_button, text_button, translate_button]
+    _locked = [model_select, switch_button, translate_button]
 
     def _set_interactive(flag):
-        return [gr.update(interactive=flag and can_switch)] * 2 + [gr.update(interactive=flag)] * 2
+        return [gr.update(interactive=flag and can_switch)] * 2 + [gr.update(interactive=flag)]
 
     switch_button.click(
         lambda: _set_interactive(False), outputs=_locked, queue=False,
@@ -694,7 +727,14 @@ with gr.Blocks(title="PLaMo Translator") as demo:
 # （vLLM の場合も、1件の中で段落を並列に投げるのでこれで十分）
 demo.queue(default_concurrency_limit=1)
 
+# 入れ替えボタン（⇄）を原文と訳文の間の縦中央に置く
+CSS = """
+#text-row { align-items: center; }
+#swap-button { font-size: 1.5rem; padding: 0.5rem; }
+"""
+
 demo.launch(
+    css=CSS,
     server_name="0.0.0.0",
     server_port=args.port
 )

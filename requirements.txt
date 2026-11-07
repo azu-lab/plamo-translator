@@ -16,3 +16,6 @@ markdown-it-py==4.2.0
 
 # モデルのダウンロード（hf コマンド）
 huggingface_hub==2.4.0
+
+# テキスト翻訳の「自動判定」で原文の言語を判定する（判定結果の表示と ⇄ の入れ替えに使う）
+lingua-language-detector==2.2.0
